@@ -1,6 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { AlertCircle, Check, Copy, Info } from 'lucide-react';
+import { type CoreStatus, useCoreRuntime } from '../coreRuntime';
+import openaiIcon from '../assets/icons/openai-light.svg';
+import claudeIcon from '../assets/icons/claude.svg';
+import geminiIcon from '../assets/icons/gemini.svg';
+import { clientApiProfiles, DEFAULT_CLIENT_API_KEY } from '../services/clientAccess';
 
 type CorePlatform = {
   os: string;
@@ -8,17 +14,6 @@ type CorePlatform = {
   assetOs: string;
   assetArch: string;
   archiveKind: 'tar.gz' | 'zip';
-};
-
-type CoreStatus = {
-  installed: boolean;
-  running: boolean;
-  managed: boolean;
-  processId: number | null;
-  currentVersion: string | null;
-  installDir: string;
-  binaryPath: string | null;
-  message: string;
 };
 
 type CoreLatest = {
@@ -45,6 +40,13 @@ type CoreInstallTask = {
 };
 
 type MessageType = 'info' | 'success' | 'error';
+type CoreProcessCommand = 'start_core_process' | 'stop_core_process' | 'restart_core_process';
+
+type GuiSettings = {
+  port: number;
+  allowLan: boolean;
+  runOnStartup: boolean;
+};
 
 let latestAutoCheckStarted = false;
 let cachedLatest: CoreLatest | null = null;
@@ -75,6 +77,7 @@ function requestLatestCore() {
 }
 
 export function KernelPage() {
+  const { publishStatus } = useCoreRuntime();
   const [coreStatus, setCoreStatus] = useState<CoreStatus | null>(null);
   const [statusError, setStatusError] = useState('');
   const [platform, setPlatform] = useState<CorePlatform | null>(null);
@@ -83,17 +86,42 @@ export function KernelPage() {
   const [latestError, setLatestError] = useState(cachedLatestError);
   const [checkingLatest, setCheckingLatest] = useState(Boolean(latestCheckPromise));
   const [allowLanAccess, setAllowLanAccess] = useState(false);
-  const [customPort, setCustomPort] = useState('');
+  const [customPort, setCustomPort] = useState('8317');
+  const [settingsLoaded, setSettingsLoaded] = useState(false);
+  const [settingsError, setSettingsError] = useState('');
   const [installing, setInstalling] = useState(false);
   const [processBusy, setProcessBusy] = useState(false);
-  const [processMessage, setProcessMessage] = useState('');
-  const [processMessageType, setProcessMessageType] = useState<MessageType>('info');
+  const [networkBusy, setNetworkBusy] = useState(false);
+  const [processNotice, setProcessNotice] = useState<{
+    message: string;
+    tone: MessageType;
+  } | null>(null);
   const [message, setMessage] = useState('');
   const [messageType, setMessageType] = useState<MessageType>('info');
   const [progress, setProgress] = useState<CoreInstallTask | null>(null);
   const [installDialogOpen, setInstallDialogOpen] = useState(false);
   const [cancellingInstall, setCancellingInstall] = useState(false);
+  const [copiedApiField, setCopiedApiField] = useState('');
+  const [lanIpv4, setLanIpv4] = useState<string | null>(null);
+  const [lanIpChecked, setLanIpChecked] = useState(false);
   const installDialogRef = useRef<HTMLDivElement>(null);
+  const savedPortRef = useRef(8317);
+  const savedAllowLanRef = useRef(false);
+  const settingsSaveRequestRef = useRef(0);
+  const processNoticeTimerRef = useRef<number | null>(null);
+  const copiedApiTimerRef = useRef<number | null>(null);
+
+  const showProcessNotice = (message: string, tone: MessageType) => {
+    if (processNoticeTimerRef.current !== null) {
+      window.clearTimeout(processNoticeTimerRef.current);
+    }
+
+    setProcessNotice({ message, tone });
+    processNoticeTimerRef.current = window.setTimeout(() => {
+      setProcessNotice(null);
+      processNoticeTimerRef.current = null;
+    }, 3600);
+  };
 
   const applyInstallTask = (task: CoreInstallTask, showFinishedDialog = true) => {
     if (!task.running && !task.message && !task.result) {
@@ -152,6 +180,7 @@ export function KernelPage() {
     loadCoreStatus();
     loadPlatform();
     loadInstallTask();
+    loadGuiSettings();
 
     if (!latestAutoCheckStarted) {
       latestAutoCheckStarted = true;
@@ -163,6 +192,12 @@ export function KernelPage() {
     return () => {
       disposed = true;
       unlisten?.();
+      if (processNoticeTimerRef.current !== null) {
+        window.clearTimeout(processNoticeTimerRef.current);
+      }
+      if (copiedApiTimerRef.current !== null) {
+        window.clearTimeout(copiedApiTimerRef.current);
+      }
     };
   }, []);
 
@@ -189,15 +224,163 @@ export function KernelPage() {
     };
   }, [installDialogOpen]);
 
+  useEffect(() => {
+    let disposed = false;
+    if (!allowLanAccess) {
+      setLanIpv4(null);
+      setLanIpChecked(false);
+      return;
+    }
+
+    setLanIpChecked(false);
+    invoke<string | null>('get_lan_ipv4')
+      .then((address) => {
+        if (!disposed) {
+          setLanIpv4(address || null);
+        }
+      })
+      .catch(() => {
+        if (!disposed) {
+          setLanIpv4(null);
+        }
+      })
+      .finally(() => {
+        if (!disposed) {
+          setLanIpChecked(true);
+        }
+      });
+
+    return () => {
+      disposed = true;
+    };
+  }, [allowLanAccess]);
+
   const loadCoreStatus = async () => {
     try {
       const result = await invoke<CoreStatus>('get_core_status');
       setCoreStatus(result);
+      publishStatus(result);
       setStatusError('');
     } catch (error) {
       setCoreStatus(null);
+      publishStatus(null);
       setStatusError(String(error));
     }
+  };
+
+  const runCoreProcessCommand = async (
+    command: CoreProcessCommand,
+    messages?: { success?: string; failure?: string },
+  ) => {
+    const actionLabel =
+      command === 'start_core_process'
+        ? '启动'
+        : command === 'stop_core_process'
+          ? '关闭'
+          : '重启';
+    setProcessBusy(true);
+
+    try {
+      const result = await invoke<CoreStatus>(command);
+      setCoreStatus(result);
+      publishStatus(result);
+      setStatusError('');
+      showProcessNotice(messages?.success ?? `内核${actionLabel}成功`, 'success');
+      return true;
+    } catch (error) {
+      const errorMessage = String(error);
+      await loadCoreStatus();
+      setStatusError(errorMessage);
+      showProcessNotice(
+        `${messages?.failure ?? `内核${actionLabel}失败`}：${errorMessage}`,
+        'error',
+      );
+      return false;
+    } finally {
+      setProcessBusy(false);
+    }
+  };
+
+  const loadGuiSettings = async () => {
+    try {
+      const settings = await invoke<GuiSettings>('get_gui_settings');
+      setAllowLanAccess(settings.allowLan);
+      setCustomPort(String(settings.port));
+      savedPortRef.current = settings.port;
+      savedAllowLanRef.current = settings.allowLan;
+      setSettingsError('');
+    } catch (error) {
+      setSettingsError(String(error));
+    } finally {
+      setSettingsLoaded(true);
+    }
+  };
+
+  const saveNetworkSettings = async (
+    allowLan: boolean,
+    port: number,
+    restartAfterSave = false,
+  ) => {
+    const requestId = ++settingsSaveRequestRef.current;
+
+    try {
+      const settings = await invoke<GuiSettings>('save_gui_settings', {
+        settings: { allowLan, port },
+      });
+      if (requestId !== settingsSaveRequestRef.current) {
+        return;
+      }
+      setAllowLanAccess(settings.allowLan);
+      setCustomPort(String(settings.port));
+      savedPortRef.current = settings.port;
+      savedAllowLanRef.current = settings.allowLan;
+      setSettingsError('');
+
+      if (restartAfterSave) {
+        if (coreStatus?.running) {
+          await runCoreProcessCommand('restart_core_process', {
+            success: '网络设置已保存，内核已重启',
+            failure: '网络设置已保存，但内核重启失败',
+          });
+        } else {
+          showProcessNotice('网络设置已保存，下次启动内核时生效', 'info');
+        }
+      }
+    } catch (error) {
+      if (requestId !== settingsSaveRequestRef.current) {
+        return;
+      }
+      setAllowLanAccess(savedAllowLanRef.current);
+      setCustomPort(String(savedPortRef.current));
+      setSettingsError(String(error));
+      if (restartAfterSave) {
+        showProcessNotice(`保存网络设置失败：${String(error)}`, 'error');
+      }
+    }
+  };
+
+  const updateAllowLanAccess = (allowLan: boolean) => {
+    const editedPort = Number(customPort);
+    const port =
+      Number.isInteger(editedPort) && editedPort >= 1 && editedPort <= 65535
+        ? editedPort
+        : savedPortRef.current;
+    setAllowLanAccess(allowLan);
+    setNetworkBusy(true);
+    void saveNetworkSettings(allowLan, port, true).finally(() => setNetworkBusy(false));
+  };
+
+  const commitCustomPort = () => {
+    const port = Number(customPort);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      setCustomPort(String(savedPortRef.current));
+      setSettingsError('端口必须在 1 到 65535 之间');
+      return;
+    }
+
+    setNetworkBusy(true);
+    void saveNetworkSettings(allowLanAccess, port, port !== savedPortRef.current)
+      .finally(() => setNetworkBusy(false));
   };
 
   const loadPlatform = async () => {
@@ -317,23 +500,20 @@ export function KernelPage() {
     setCancellingInstall(false);
   };
 
-  const runCoreProcessCommand = async (command: string, doing: string, done: string) => {
-    setProcessBusy(true);
-    setProcessMessage(doing);
-    setProcessMessageType('info');
-
+  const copyApiValue = async (value: string, field: string, message: string) => {
     try {
-      const result = await invoke<CoreStatus>(command);
-      setCoreStatus(result);
-      setStatusError('');
-      setProcessMessage(done);
-      setProcessMessageType('success');
-    } catch (error) {
-      setProcessMessage(String(error));
-      setProcessMessageType('error');
-      await loadCoreStatus();
-    } finally {
-      setProcessBusy(false);
+      await navigator.clipboard.writeText(value);
+      setCopiedApiField(field);
+      showProcessNotice(message, 'success');
+      if (copiedApiTimerRef.current !== null) {
+        window.clearTimeout(copiedApiTimerRef.current);
+      }
+      copiedApiTimerRef.current = window.setTimeout(() => {
+        setCopiedApiField('');
+        copiedApiTimerRef.current = null;
+      }, 1800);
+    } catch {
+      showProcessNotice('复制接入信息失败', 'error');
     }
   };
 
@@ -369,7 +549,6 @@ export function KernelPage() {
     : statusError
       ? '检测失败'
       : '检测中';
-  const statusMessage = coreStatus?.message || statusError || '正在检测 CPA 内核';
   const latestLabel = checkingLatest
     ? '检查中'
     : latestVersion || (latestError ? '检查失败' : '未检查');
@@ -386,12 +565,6 @@ export function KernelPage() {
   const platformOsLabel = platform?.os || (platformError ? '检测失败' : '检测中');
   const platformArchLabel = platform?.arch || (platformError ? '检测失败' : '检测中');
   const installTaskRunning = Boolean(installing || progress?.running);
-  const controlSubtitle = processMessage || statusMessage;
-  const controlSubtitleTone: MessageType = processMessage
-    ? processMessageType
-    : statusError
-      ? 'error'
-      : 'info';
   const versionStatusLabel = installTaskRunning
     ? cancellingInstall
       ? '正在取消下载'
@@ -432,6 +605,18 @@ export function KernelPage() {
     : '关闭';
   const installDialogActionDisabled =
     installTaskRunning && (cancellingInstall || !progress?.cancellable);
+  const apiPort = Number(customPort);
+  const apiProfiles = clientApiProfiles(
+    Number.isInteger(apiPort) && apiPort >= 1 && apiPort <= 65535
+      ? apiPort
+      : savedPortRef.current,
+    allowLanAccess ? lanIpv4 : null,
+  );
+  const apiProfileIcons = {
+    openai: openaiIcon,
+    claude: claudeIcon,
+    gemini: geminiIcon,
+  } as const;
 
   return (
     <section className="page kernel-page">
@@ -462,11 +647,10 @@ export function KernelPage() {
           <div className="panel-heading">
             <div>
               <h2>运行控制</h2>
-              <p className={controlSubtitleTone} title={controlSubtitle}>
-                {controlSubtitle}
-              </p>
             </div>
-            <span className={`state-pill ${statusTone}`}>{statusLabel}</span>
+            <span className={`state-pill ${statusTone}`} title={statusError || undefined}>
+              {processBusy || networkBusy ? '处理中' : statusLabel}
+            </span>
           </div>
 
           <dl className="panel-detail-grid">
@@ -483,14 +667,15 @@ export function KernelPage() {
               <dd>{coreStatus?.processId || '无'}</dd>
             </div>
             <div className="panel-detail-row">
-              <dt>局域网</dt>
+              <dt>允许局域网</dt>
               <dd className="detail-control-cell">
-                <span className="switch-control" title="允许局域网访问">
+                <span className="switch-control" title="切换后会自动重启正在运行的内核">
                   <input
                     type="checkbox"
                     aria-label="允许局域网访问"
+                    disabled={!settingsLoaded || networkBusy || processBusy}
                     checked={allowLanAccess}
-                    onChange={(event) => setAllowLanAccess(event.currentTarget.checked)}
+                    onChange={(event) => updateAllowLanAccess(event.currentTarget.checked)}
                   />
                   <span className="switch-track" />
                 </span>
@@ -503,16 +688,25 @@ export function KernelPage() {
               <dd className="detail-control-cell">
                 <input
                   id="custom-port"
-                  className="compact-text-input"
+                  className={`compact-text-input ${settingsError ? 'error' : ''}`}
                   type="text"
                   inputMode="numeric"
                   pattern="[0-9]*"
                   maxLength={5}
                   placeholder="端口号"
+                  title={settingsError || '端口范围 1-65535'}
+                  aria-invalid={Boolean(settingsError)}
+                  disabled={!settingsLoaded || networkBusy || processBusy}
                   value={customPort}
                   onChange={(event) =>
                     setCustomPort(event.currentTarget.value.replace(/\D/g, '').slice(0, 5))
                   }
+                  onBlur={commitCustomPort}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter') {
+                      event.currentTarget.blur();
+                    }
+                  }}
                 />
               </dd>
             </div>
@@ -521,34 +715,23 @@ export function KernelPage() {
           <div className="button-row panel-action-row control-action-row">
             <button
               type="button"
-              className="primary-button"
-              disabled={!coreInstalled || coreRunning || installing || processBusy}
+              className={coreRunning ? 'danger-button' : 'primary-button'}
+              disabled={!coreInstalled || installing || processBusy || networkBusy}
               onClick={() =>
-                runCoreProcessCommand('start_core_process', '正在启动 CPA 内核', 'CPA 内核已启动')
+                void runCoreProcessCommand(
+                  coreRunning ? 'stop_core_process' : 'start_core_process',
+                  { success: coreRunning ? '内核已关闭' : '内核已启动' },
+                )
               }
             >
-              {processBusy ? '处理中' : '启动'}
-            </button>
-            <button
-              type="button"
-              className="danger-button"
-              disabled={!coreInstalled || !coreRunning || installing || processBusy}
-              onClick={() =>
-                runCoreProcessCommand('stop_core_process', '正在关闭 CPA 内核', 'CPA 内核已关闭')
-              }
-            >
-              关闭
+              {processBusy ? '处理中' : coreRunning ? '关闭' : '启动'}
             </button>
             <button
               type="button"
               className="secondary-button"
-              disabled={!coreInstalled || !coreRunning || installing || processBusy}
+              disabled={!coreInstalled || !coreRunning || installing || processBusy || networkBusy}
               onClick={() =>
-                runCoreProcessCommand(
-                  'restart_core_process',
-                  '正在重启 CPA 内核',
-                  'CPA 内核已重启',
-                )
+                void runCoreProcessCommand('restart_core_process', { success: '内核已重启' })
               }
             >
               重启
@@ -556,7 +739,7 @@ export function KernelPage() {
             <button
               type="button"
               className="secondary-button"
-              disabled={processBusy}
+              disabled={processBusy || networkBusy}
               onClick={loadCoreStatus}
             >
               刷新状态
@@ -569,7 +752,6 @@ export function KernelPage() {
           <div className="panel-heading">
             <div>
               <h2>版本管理</h2>
-              <p>检查和安装 CPA 内核版本</p>
             </div>
           </div>
 
@@ -630,6 +812,93 @@ export function KernelPage() {
         </div>
       </div>
 
+      <section className="panel client-api-panel">
+        <div className="panel-heading client-api-heading">
+          <div>
+            <h2>API URL</h2>
+            <p>默认密钥：{DEFAULT_CLIENT_API_KEY}</p>
+          </div>
+          <span className={`state-pill ${coreRunning ? 'success' : ''}`}>
+            {coreRunning ? '可连接' : '等待内核启动'}
+          </span>
+        </div>
+
+        <div className="client-api-grid">
+          {apiProfiles.map((profile) => (
+            <article className={`client-api-card ${profile.id}`} key={profile.id}>
+              <div className="client-api-card-heading">
+                <span className="client-api-logo">
+                  <img src={apiProfileIcons[profile.id]} alt="" />
+                </span>
+                <div>
+                  <strong>{profile.name}</strong>
+                  <span>{profile.description}</span>
+                </div>
+              </div>
+
+              <div className="client-api-values">
+                <div className="client-api-value-row">
+                  <span>本机 URL</span>
+                  <code title={profile.baseUrl}>{profile.baseUrl}</code>
+                  <button
+                    type="button"
+                    className="icon-button quiet"
+                    onClick={() =>
+                      void copyApiValue(
+                        profile.baseUrl,
+                        `${profile.id}:base`,
+                        `${profile.name} 本机 URL 已复制`,
+                      )
+                    }
+                    title={`复制 ${profile.name} 本机 URL`}
+                    aria-label={`复制 ${profile.name} 本机 URL`}
+                  >
+                    {copiedApiField === `${profile.id}:base` ? (
+                      <Check size={15} aria-hidden="true" />
+                    ) : (
+                      <Copy size={15} aria-hidden="true" />
+                    )}
+                  </button>
+                </div>
+                {allowLanAccess ? (
+                  <div className="client-api-value-row">
+                    <span>局域网 URL</span>
+                    <code title={profile.lanUrl || undefined}>
+                      {!lanIpChecked
+                        ? '正在检测局域网 IP'
+                        : profile.lanUrl || '未检测到局域网 IP'}
+                    </code>
+                    {profile.lanUrl ? (
+                      <button
+                        type="button"
+                        className="icon-button quiet"
+                        onClick={() =>
+                          void copyApiValue(
+                            profile.lanUrl!,
+                            `${profile.id}:lan`,
+                            `${profile.name} 局域网 URL 已复制`,
+                          )
+                        }
+                        title={`复制 ${profile.name} 局域网 URL`}
+                        aria-label={`复制 ${profile.name} 局域网 URL`}
+                      >
+                        {copiedApiField === `${profile.id}:lan` ? (
+                          <Check size={15} aria-hidden="true" />
+                        ) : (
+                          <Copy size={15} aria-hidden="true" />
+                        )}
+                      </button>
+                    ) : (
+                      <span className="client-api-copy-placeholder" aria-hidden="true" />
+                    )}
+                  </div>
+                ) : null}
+              </div>
+            </article>
+          ))}
+        </div>
+      </section>
+
       {installDialogOpen && progress ? (
         <div className="install-dialog-backdrop">
           <div
@@ -685,6 +954,23 @@ export function KernelPage() {
               {installDialogAction}
             </button>
           </div>
+        </div>
+      ) : null}
+
+      {processNotice ? (
+        <div
+          className={`config-toast ${processNotice.tone}`}
+          role="status"
+          title={processNotice.message}
+        >
+          {processNotice.tone === 'success' ? (
+            <Check size={17} aria-hidden="true" />
+          ) : processNotice.tone === 'error' ? (
+            <AlertCircle size={17} aria-hidden="true" />
+          ) : (
+            <Info size={17} aria-hidden="true" />
+          )}
+          <span>{processNotice.message}</span>
         </div>
       ) : null}
     </section>
